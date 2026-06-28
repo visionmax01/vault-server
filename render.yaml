@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: vault-server
+    runtime: node
+    buildCommand: npm install
+    startCommand: node src/server.js
+    plan: free # Deploys on Render's permanent free tier
+    envVars:
+      - key: PORT
+        value: 5000
+      - key: MONGO_URI
+        sync: false # User will input their MongoDB Atlas URI
+      - key: JWT_SECRET
+        generateValue: true # Generates a random secure key automatically
+      - key: MINIO_ENDPOINT
+        sync: false # S3-compatible host (e.g. s3.us-west-004.backblazeb2.com or Cloudflare R2 endpoint)
+      - key: MINIO_PORT
+        value: "443" # Cloud S3 endpoints use standard HTTPS port 443
+      - key: MINIO_USE_SSL
+        value: "true" # Must be true for secure cloud storage
+      - key: MINIO_ACCESS_KEY
+        sync: false
+      - key: MINIO_SECRET_KEY
+        sync: false
+      - key: MINIO_BUCKET
+        sync: false # The name of your cloud storage bucket

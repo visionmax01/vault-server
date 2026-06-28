@@ -24,3 +24,5 @@ services:
         sync: false
       - key: MINIO_BUCKET
         sync: false # The name of your cloud storage bucket
+      - key: MINIO_REGION
+        sync: false # The region of your cloud storage bucket (e.g. us-east-005)

@@ -7,6 +7,7 @@ const minioClient = new Minio.Client({
   useSSL: process.env.MINIO_USE_SSL === 'true',
   accessKey: process.env.MINIO_ACCESS_KEY || 'minioadmin',
   secretKey: process.env.MINIO_SECRET_KEY || 'minioadmin',
+  region: process.env.MINIO_REGION || undefined,
 });
 
 const bucketName = process.env.MINIO_BUCKET || 'vault-files';
@@ -18,7 +19,7 @@ const initMinio = async () => {
     if (exists) {
       console.log(`MinIO bucket "${bucketName}" already exists.`);
     } else {
-      await minioClient.makeBucket(bucketName, 'us-east-1');
+      await minioClient.makeBucket(bucketName, process.env.MINIO_REGION || 'us-east-1');
       console.log(`MinIO bucket "${bucketName}" created successfully.`);
     }
   } catch (error) {

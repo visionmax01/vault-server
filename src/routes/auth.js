@@ -15,4 +15,16 @@ router.post('/login', authController.login);
 // @desc    Get current user profile details
 router.get('/me', authMiddleware, authController.me);
 
+// @route   PATCH api/auth/profile
+// @desc    Update user profile name
+router.patch('/profile', authMiddleware, authController.updateProfile);
+
+// @route   POST api/auth/change-password
+// @desc    Change user password
+router.post('/change-password', authMiddleware, authController.changePassword);
+
+// @route   DELETE api/auth/account
+// @desc    Delete user account and all data recursively
+router.delete('/account', authMiddleware, authController.deleteAccount);
+
 module.exports = router;

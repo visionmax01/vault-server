@@ -216,43 +216,70 @@ exports.deleteAccount = async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // 1. Fetch user to get avatar
+    // 1. Fetch user
     const user = await User.findById(userId);
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    // 2. Fetch all user files
+    // 2. Fetch all user files to delete associated Movie records
     const files = await File.find({ owner: userId });
+    const fileKeys = files.map(f => f.key);
 
-    // 3. Delete files from MinIO / Backblaze B2
     const { minioClient, bucketName } = require('../config/minio');
-    for (const file of files) {
-      try {
-        await minioClient.removeObject(bucketName, file.key);
-      } catch (err) {
-        console.warn(`Failed to delete file object ${file.key} from MinIO:`, err);
-      }
 
-      if (file.thumbnailKey) {
-        try {
-          await minioClient.removeObject(bucketName, file.thumbnailKey);
-        } catch (err) {
-          console.warn(`Failed to delete thumbnail object ${file.thumbnailKey} from MinIO:`, err);
+    if (fileKeys.length > 0) {
+      try {
+        const Movie = require('../models/Movie');
+        // Clean up movie posters first if they are not stored under the user's directory prefix
+        const movies = await Movie.find({ videoKey: { $in: fileKeys } });
+        for (const movie of movies) {
+          if (movie.posterKey && !movie.posterKey.startsWith(`${userId}/`)) {
+            await minioClient.removeObject(bucketName, movie.posterKey).catch(err => {
+              console.warn(`Failed to delete out-of-prefix movie poster ${movie.posterKey}:`, err);
+            });
+          }
         }
-      }
-    }
-
-    // 4. Delete user profile avatar from MinIO
-    if (user.avatarKey) {
-      try {
-        await minioClient.removeObject(bucketName, user.avatarKey);
+        await Movie.deleteMany({ videoKey: { $in: fileKeys } });
       } catch (err) {
-        console.warn(`Failed to delete avatar object ${user.avatarKey} from MinIO:`, err);
+        console.warn('Failed to clean up Movie records:', err);
       }
     }
 
-    // 5. Delete DB documents
+    // 3. Delete ALL objects starting with user prefix from MinIO (includes all raw files, transcoded HLS TS chunks, thumbnails, and avatar)
+    const prefix = `${userId}/`;
+    const objectsList = [];
+    const stream = minioClient.listObjectsV2(bucketName, prefix, true);
+
+    await new Promise((resolve, reject) => {
+      stream.on('data', (obj) => {
+        objectsList.push(obj.name);
+      });
+      stream.on('error', (err) => {
+        console.error('Error listing objects for account deletion:', err);
+        reject(err);
+      });
+      stream.on('end', async () => {
+        try {
+          if (objectsList.length > 0) {
+            // MinIO removeObjects handles up to 1000 objects in a batch request.
+            // Let's batch delete them in chunks of 1000 just in case there are thousands of HLS TS chunks.
+            const chunkSize = 1000;
+            for (let i = 0; i < objectsList.length; i += chunkSize) {
+              const chunk = objectsList.slice(i, i + chunkSize);
+              await minioClient.removeObjects(bucketName, chunk);
+            }
+            console.log(`Successfully removed ${objectsList.length} objects from bucket for user ${userId}.`);
+          }
+          resolve();
+        } catch (err) {
+          console.error('Error removing objects for account deletion:', err);
+          reject(err);
+        }
+      });
+    });
+
+    // 4. Delete DB documents
     const Folder = require('../models/Folder');
     await File.deleteMany({ owner: userId });
     await Folder.deleteMany({ owner: userId });

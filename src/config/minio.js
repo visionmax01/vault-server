@@ -11,7 +11,8 @@ if (portStr) {
   }
 }
 
-const endPoint = process.env.MINIO_ENDPOINT || 'localhost';
+const rawEndPoint = process.env.MINIO_ENDPOINT || 'localhost';
+const endPoint = rawEndPoint.replace(/^https?:\/\//i, '').split('/')[0].trim();
 const isLocalhost = endPoint === 'localhost' || endPoint === '127.0.0.1';
 
 const minioClient = new Minio.Client({

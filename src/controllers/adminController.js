@@ -639,7 +639,9 @@ exports.resolvePaymentRequest = async (req, res) => {
       await targetUser.save();
       paymentReq.status = 'approved';
     } else {
+      const { reason } = req.body;
       paymentReq.status = 'rejected';
+      paymentReq.rejectionReason = reason || 'No specific reason provided';
     }
 
     await paymentReq.save();

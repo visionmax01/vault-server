@@ -100,6 +100,19 @@ exports.createFolder = async (req, res) => {
   }
 };
 
+const getOrCreateUserVaultFolder = async (user) => {
+  if (user.vaultFolder) {
+    return user.vaultFolder;
+  }
+  const cleanUserName = user.name.toLowerCase().replace(/[^a-z0-9]/g, '_');
+  const randomNum = Math.floor(100000000 + Math.random() * 900000000);
+  const folderName = `${cleanUserName}_${randomNum}`;
+  
+  user.vaultFolder = folderName;
+  await user.save();
+  return folderName;
+};
+
 // Helper to process and save uploaded file (MinIO upload, HLS transcoding, PDF/Video thumbnail, DB record)
 const processAndSaveUploadedFile = async (owner, folderId, filePath, fileSize, originalName, mimeType) => {
   // Get User and verify storage availability
@@ -108,6 +121,8 @@ const processAndSaveUploadedFile = async (owner, folderId, filePath, fileSize, o
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
     throw new Error('User not found');
   }
+
+  const userVaultFolder = await getOrCreateUserVaultFolder(user);
 
   // Dynamic storage consumption aggregate check
   const existingFiles = await File.find({ owner });
@@ -120,7 +135,7 @@ const processAndSaveUploadedFile = async (owner, folderId, filePath, fileSize, o
 
   // Generate unique object key inside MinIO
   const cleanName = originalName.replace(/[^a-zA-Z0-9.-]/g, '_');
-  const minioKey = `${owner}/${Date.now()}_${cleanName}`;
+  const minioKey = `${userVaultFolder}/${Date.now()}_${cleanName}`;
 
   let finalMimeType = mimeType;
   let finalKey = minioKey;
@@ -142,7 +157,7 @@ const processAndSaveUploadedFile = async (owner, folderId, filePath, fileSize, o
       await transcodeToHLS(filePath, transcodeDir);
 
       const cleanNameNoExt = cleanName.substring(0, cleanName.lastIndexOf('.')) || cleanName;
-      const hlsPrefix = `${owner}/${Date.now()}_${cleanNameNoExt}`;
+      const hlsPrefix = `${userVaultFolder}/${Date.now()}_${cleanNameNoExt}`;
 
       const filesList = fs.readdirSync(transcodeDir);
       for (const fileItem of filesList) {
@@ -170,7 +185,7 @@ const processAndSaveUploadedFile = async (owner, folderId, filePath, fileSize, o
       // Fallback upload
       const metaData = {
         'Content-Type': mimeType,
-        'Original-Name': originalName,
+        'Original-Name': encodeURIComponent(originalName),
         'Owner-Id': owner,
       };
       await minioClient.fPutObject(bucketName, minioKey, filePath, metaData);
@@ -182,7 +197,7 @@ const processAndSaveUploadedFile = async (owner, folderId, filePath, fileSize, o
     // Standard upload
     const metaData = {
       'Content-Type': mimeType,
-      'Original-Name': originalName,
+      'Original-Name': encodeURIComponent(originalName),
       'Owner-Id': owner,
     };
     await minioClient.fPutObject(bucketName, minioKey, filePath, metaData);
@@ -199,7 +214,7 @@ const processAndSaveUploadedFile = async (owner, folderId, filePath, fileSize, o
       });
       if (pngPages && pngPages.length > 0) {
         const pngBuffer = pngPages[0].content;
-        thumbnailKey = `${owner}/thumbnails/${Date.now()}_thumb.png`;
+        thumbnailKey = `${userVaultFolder}/thumbnails/${Date.now()}_thumb.png`;
         const thumbMetaData = {
           'Content-Type': 'image/png',
           'Owner-Id': owner,
@@ -218,7 +233,7 @@ const processAndSaveUploadedFile = async (owner, folderId, filePath, fileSize, o
       await extractVideoThumbnail(filePath, thumbTempPath);
       if (fs.existsSync(thumbTempPath)) {
         const pngBuffer = fs.readFileSync(thumbTempPath);
-        thumbnailKey = `${owner}/thumbnails/${Date.now()}_thumb.png`;
+        thumbnailKey = `${userVaultFolder}/thumbnails/${Date.now()}_thumb.png`;
         const thumbMetaData = {
           'Content-Type': 'image/png',
           'Owner-Id': owner,
@@ -817,6 +832,14 @@ exports.submitSubscriptionRequest = async (req, res) => {
     const owner = req.user.id;
     const { plan, billing, paypalId } = req.body;
 
+    const user = await User.findById(owner);
+    if (!user) {
+      if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const userVaultFolder = await getOrCreateUserVaultFolder(user);
+
     if (!req.file) {
       return res.status(400).json({ message: 'Payment screenshot is required' });
     }
@@ -853,7 +876,7 @@ exports.submitSubscriptionRequest = async (req, res) => {
 
     // Upload screenshot to MinIO under user's payment folder
     const cleanName = req.file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
-    const screenshotKey = `${owner}/payment/${Date.now()}_${cleanName}`;
+    const screenshotKey = `${userVaultFolder}/payment/${Date.now()}_${cleanName}`;
 
     const metaData = {
       'Content-Type': mimeType,
@@ -1070,6 +1093,8 @@ exports.uploadAvatar = async (req, res) => {
       return res.status(404).json({ message: 'User not found' });
     }
 
+    const userVaultFolder = await getOrCreateUserVaultFolder(user);
+
     // Clean up old avatar if exists
     if (user.avatarKey) {
       await minioClient.removeObject(bucketName, user.avatarKey).catch(err => {
@@ -1078,7 +1103,7 @@ exports.uploadAvatar = async (req, res) => {
     }
 
     const cleanName = req.file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
-    const avatarKey = `${owner}/avatar/${Date.now()}_${cleanName}`;
+    const avatarKey = `${userVaultFolder}/avatar/${Date.now()}_${cleanName}`;
 
     // Upload to MinIO
     const metaData = {

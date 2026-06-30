@@ -1,13 +1,27 @@
 const Minio = require('minio');
 require('dotenv').config();
 
+const useSSL = process.env.MINIO_USE_SSL === 'true';
+const portStr = process.env.MINIO_PORT;
+let port = undefined;
+if (portStr) {
+  const parsedPort = parseInt(portStr, 10);
+  if (parsedPort !== 80 && parsedPort !== 443) {
+    port = parsedPort;
+  }
+}
+
+const endPoint = process.env.MINIO_ENDPOINT || 'localhost';
+const isLocalhost = endPoint === 'localhost' || endPoint === '127.0.0.1';
+
 const minioClient = new Minio.Client({
-  endPoint: process.env.MINIO_ENDPOINT || 'localhost',
-  port: parseInt(process.env.MINIO_PORT || '9000', 10),
-  useSSL: process.env.MINIO_USE_SSL === 'true',
+  endPoint,
+  port,
+  useSSL,
   accessKey: process.env.MINIO_ACCESS_KEY || 'minioadmin',
   secretKey: process.env.MINIO_SECRET_KEY || 'minioadmin',
   region: process.env.MINIO_REGION || undefined,
+  pathStyle: !isLocalhost,
 });
 
 const bucketName = process.env.MINIO_BUCKET || 'vault-files';

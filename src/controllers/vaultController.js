@@ -762,11 +762,7 @@ exports.streamFile = async (req, res) => {
   } catch (error) {
     console.error('Server error streaming file:', error);
     if (!res.headersSent) {
-      return res.status(500).json({
-        message: 'Server error streaming file',
-        error: error.message,
-        stack: error.stack
-      });
+      return res.status(500).json({ message: 'Server error streaming file' });
     }
   }
 };
@@ -1070,11 +1066,7 @@ exports.streamThumbnail = async (req, res) => {
   } catch (error) {
     console.error('Thumbnail streaming proxy error:', error);
     if (!res.headersSent) {
-      return res.status(500).json({
-        message: 'Server error streaming thumbnail',
-        error: error.message,
-        stack: error.stack
-      });
+      return res.status(500).json({ message: 'Server error streaming thumbnail' });
     }
   }
 };

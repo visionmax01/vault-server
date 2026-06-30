@@ -11,11 +11,11 @@ const extractVideoThumbnail = (videoPath, outputPath) => {
   return new Promise((resolve, reject) => {
     // -y overrides output, -ss 00:00:01 seek position, -vframes 1 captures 1 frame
     const cmd = `ffmpeg -y -i "${videoPath}" -ss 00:00:01 -vframes 1 -f image2 "${outputPath}"`;
-    exec(cmd, (error) => {
+    exec(cmd, { maxBuffer: 1024 * 1024 * 10 }, (error) => {
       if (error) {
         // Fallback to beginning of video if 1 sec seek fails
         const fallbackCmd = `ffmpeg -y -i "${videoPath}" -ss 00:00:00 -vframes 1 -f image2 "${outputPath}"`;
-        exec(fallbackCmd, (fallbackErr) => {
+        exec(fallbackCmd, { maxBuffer: 1024 * 1024 * 10 }, (fallbackErr) => {
           if (fallbackErr) reject(fallbackErr);
           else resolve();
         });

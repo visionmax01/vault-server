@@ -70,7 +70,7 @@ const transcodeToHLS = async (filePath, outputDir) => {
 
     console.log('[Transcoder] Running command:', cmd);
 
-    exec(cmd, (error, stdout, stderr) => {
+    exec(cmd, { maxBuffer: 1024 * 1024 * 100 }, (error, stdout, stderr) => {
       if (error) {
         console.error('[Transcoder] ffmpeg error:', error);
         console.error('[Transcoder] ffmpeg stderr:', stderr);

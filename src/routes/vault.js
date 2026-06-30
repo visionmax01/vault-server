@@ -90,6 +90,14 @@ router.get('/files/stream/:fileId/:filename?', vaultController.streamFile);
 // @desc    Upgrade subscription tier
 router.post('/subscription', vaultController.updateSubscription);
 
+// @route   POST api/vault/subscription/request
+// @desc    Submit upgrade payment details request
+router.post('/subscription/request', upload.single('screenshot'), vaultController.submitSubscriptionRequest);
+
+// @route   GET api/vault/subscription/status
+// @desc    Get current user upgrade status
+router.get('/subscription/status', vaultController.getSubscriptionStatus);
+
 // @route   PATCH api/vault/folders/:folderId
 // @desc    Rename or move a folder
 router.patch('/folders/:folderId', vaultController.updateFolder);

@@ -569,3 +569,117 @@ exports.updateMovie = async (req, res) => {
     return res.status(500).json({ message: 'Server error updating movie' });
   }
 };
+
+// List all pending payment requests
+exports.listPaymentRequests = async (req, res) => {
+  try {
+    const PaymentRequest = require('../models/PaymentRequest');
+    const requests = await PaymentRequest.find({ status: 'pending' })
+      .populate('user', 'name email')
+      .sort({ createdAt: -1 });
+
+    return res.json(requests);
+  } catch (error) {
+    console.error('List payment requests error:', error);
+    return res.status(500).json({ message: 'Server error listing payment requests' });
+  }
+};
+
+// Approve or reject payment verification requests
+exports.resolvePaymentRequest = async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const { action } = req.body; // 'approve' | 'reject'
+
+    if (!['approve', 'reject'].includes(action)) {
+      return res.status(400).json({ message: 'Invalid action. Must be approve or reject' });
+    }
+
+    const PaymentRequest = require('../models/PaymentRequest');
+    const paymentReq = await PaymentRequest.findById(requestId);
+    if (!paymentReq) {
+      return res.status(404).json({ message: 'Payment request not found' });
+    }
+
+    if (paymentReq.status !== 'pending') {
+      return res.status(400).json({ message: 'Payment request has already been resolved' });
+    }
+
+    if (action === 'approve') {
+      const targetUser = await User.findById(paymentReq.user);
+      if (!targetUser) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+
+      // Calculate new storage limit based on the requested plan
+      let storageLimit = 3 * 1024 * 1024 * 1024; // 3GB free default fallback
+      if (paymentReq.plan === 'silver') {
+        storageLimit = 20 * 1024 * 1024 * 1024; // 20GB
+      } else if (paymentReq.plan === 'gold') {
+        storageLimit = 50 * 1024 * 1024 * 1024; // 50GB
+      } else if (paymentReq.plan === 'platinum') {
+        storageLimit = 100 * 1024 * 1024 * 1024; // 100GB
+      }
+
+      // Set expiry date: 30 days for monthly, 365 days for yearly
+      let expiresAt = null;
+      if (paymentReq.billing === 'monthly') {
+        expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+      } else if (paymentReq.billing === 'yearly') {
+        expiresAt = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
+      }
+
+      targetUser.storageLimit = storageLimit;
+      targetUser.subscription = {
+        plan: paymentReq.plan,
+        billing: paymentReq.billing,
+        expiresAt
+      };
+
+      await targetUser.save();
+      paymentReq.status = 'approved';
+    } else {
+      paymentReq.status = 'rejected';
+    }
+
+    await paymentReq.save();
+    return res.json({
+      message: `Payment request has been successfully ${action}d.`,
+      request: paymentReq
+    });
+  } catch (error) {
+    console.error('Resolve payment request error:', error);
+    return res.status(500).json({ message: 'Server error resolving payment request' });
+  }
+};
+
+// Stream payment verification screenshot image from MinIO
+exports.streamPaymentScreenshot = async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const PaymentRequest = require('../models/PaymentRequest');
+    const paymentReq = await PaymentRequest.findById(requestId);
+    
+    if (!paymentReq) {
+      return res.status(404).json({ message: 'Payment request not found' });
+    }
+
+    const { minioClient, bucketName } = require('../config/minio');
+    
+    // Check if object exists in MinIO
+    try {
+      const stat = await minioClient.statObject(bucketName, paymentReq.screenshotKey);
+      res.setHeader('Content-Type', stat.metaData['content-type'] || 'image/png');
+      res.setHeader('Content-Length', stat.size);
+      
+      const dataStream = await minioClient.getObject(bucketName, paymentReq.screenshotKey);
+      dataStream.pipe(res);
+    } catch (err) {
+      console.error('Failed to retrieve screenshot from MinIO:', err);
+      return res.status(404).json({ message: 'Screenshot file not found in storage' });
+    }
+  } catch (error) {
+    console.error('Stream payment screenshot error:', error);
+    return res.status(500).json({ message: 'Server error streaming screenshot' });
+  }
+};

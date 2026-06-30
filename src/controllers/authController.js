@@ -86,6 +86,11 @@ exports.login = async (req, res) => {
       return res.status(400).json({ message: 'Invalid credentials' });
     }
 
+    // Verify user is not blocked
+    if (user.isBlocked) {
+      return res.status(403).json({ message: 'Your account has been blocked. Please contact us at support@visionmax.com.' });
+    }
+
     // Compute storage used dynamically
     const files = await File.find({ owner: user._id });
     const usedStorage = files.reduce((acc, curr) => acc + (curr.size || 0), 0);

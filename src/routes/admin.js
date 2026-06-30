@@ -64,4 +64,16 @@ router.patch('/movies/:movieId', upload.fields([
 // @desc    Delete public streaming movie
 router.delete('/movies/:movieId', adminController.deleteMovie);
 
+// @route   GET api/admin/subscription/requests
+// @desc    List all pending subscription upgrade requests
+router.get('/subscription/requests', adminController.listPaymentRequests);
+
+// @route   POST api/admin/subscription/requests/:requestId/resolve
+// @desc    Approve or reject a payment request
+router.post('/subscription/requests/:requestId/resolve', adminController.resolvePaymentRequest);
+
+// @route   GET api/admin/subscription/screenshot/:requestId
+// @desc    Stream payment verification screenshot
+router.get('/subscription/screenshot/:requestId', adminController.streamPaymentScreenshot);
+
 module.exports = router;

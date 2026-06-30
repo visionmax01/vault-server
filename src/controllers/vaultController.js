@@ -1,6 +1,7 @@
 const Folder = require('../models/Folder');
 const File = require('../models/File');
 const User = require('../models/User');
+const PaymentRequest = require('../models/PaymentRequest');
 const { minioClient, bucketName } = require('../config/minio');
 const fs = require('fs');
 const path = require('path');
@@ -752,6 +753,7 @@ exports.streamFile = async (req, res) => {
 };
 
 // 7. Simulated Subscription update
+// 7. Simulated Subscription update
 exports.updateSubscription = async (req, res) => {
   try {
     const owner = req.user.id;
@@ -806,6 +808,96 @@ exports.updateSubscription = async (req, res) => {
   } catch (error) {
     console.error('Update subscription plan error:', error);
     return res.status(500).json({ message: 'Server error updating subscription plan' });
+  }
+};
+
+// Submit a payment/upgrade request with screenshot
+exports.submitSubscriptionRequest = async (req, res) => {
+  try {
+    const owner = req.user.id;
+    const { plan, billing, paypalId } = req.body;
+
+    if (!req.file) {
+      return res.status(400).json({ message: 'Payment screenshot is required' });
+    }
+
+    if (!['silver', 'gold', 'platinum'].includes(plan)) {
+      if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+      return res.status(400).json({ message: 'Invalid plan selected' });
+    }
+
+    if (!['monthly', 'yearly'].includes(billing)) {
+      if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+      return res.status(400).json({ message: 'Invalid billing option' });
+    }
+
+    if (!paypalId || !paypalId.trim()) {
+      if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+      return res.status(400).json({ message: 'PayPal ID is required' });
+    }
+
+    // Check if there is already a pending request for this user
+    const pendingRequest = await PaymentRequest.findOne({ user: owner, status: 'pending' });
+    if (pendingRequest) {
+      if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+      return res.status(400).json({ message: 'You already have a payment verification in review' });
+    }
+
+    const filePath = req.file.path;
+    const mimeType = req.file.mimetype;
+
+    if (!mimeType.startsWith('image/')) {
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      return res.status(400).json({ message: 'Payment screenshot must be an image' });
+    }
+
+    // Upload screenshot to MinIO under user's payment folder
+    const cleanName = req.file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
+    const screenshotKey = `${owner}/payment/${Date.now()}_${cleanName}`;
+
+    const metaData = {
+      'Content-Type': mimeType,
+      'Owner-Id': owner,
+    };
+
+    await minioClient.fPutObject(bucketName, screenshotKey, filePath, metaData);
+
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+
+    const newRequest = await PaymentRequest.create({
+      user: owner,
+      plan,
+      billing,
+      paypalId: paypalId.trim(),
+      screenshotKey,
+      status: 'pending'
+    });
+
+    return res.status(201).json({
+      message: 'Payment details submitted successfully and is in review',
+      request: newRequest
+    });
+  } catch (error) {
+    console.error('Submit subscription request error:', error);
+    if (req.file && fs.existsSync(req.file.path)) {
+      try { fs.unlinkSync(req.file.path); } catch {}
+    }
+    return res.status(500).json({ message: error.message || 'Server error submitting payment details' });
+  }
+};
+
+// Get current subscription request status
+exports.getSubscriptionStatus = async (req, res) => {
+  try {
+    const owner = req.user.id;
+    // Find the latest request
+    const latestRequest = await PaymentRequest.findOne({ user: owner }).sort({ createdAt: -1 });
+    return res.json({ request: latestRequest });
+  } catch (error) {
+    console.error('Get subscription status error:', error);
+    return res.status(500).json({ message: 'Server error fetching subscription status' });
   }
 };
 

@@ -252,41 +252,44 @@ exports.deleteAccount = async (req, res) => {
     }
 
     // 3. Delete ALL objects starting with user prefix from MinIO (includes all raw files, transcoded HLS TS chunks, thumbnails, and avatar)
-    const prefix = `${userId}/`;
+    const prefixes = [];
+    if (user.vaultFolder) {
+      prefixes.push(`${user.vaultFolder}/`);
+    }
+    prefixes.push(`${userId}/`);
+
     const objectsList = [];
 
     try {
-      const stream = minioClient.listObjectsV2(bucketName, prefix, true);
+      for (const prefix of prefixes) {
+        const stream = minioClient.listObjectsV2(bucketName, prefix, true);
 
-      await new Promise((resolve, reject) => {
-        stream.on('data', (obj) => {
-          if (obj && obj.name) {
-            objectsList.push(obj.name);
-          }
-        });
-        stream.on('error', (err) => {
-          console.error('Error listing objects for account deletion:', err);
-          reject(err);
-        });
-        stream.on('end', async () => {
-          try {
-            if (objectsList.length > 0) {
-              // MinIO removeObjects handles up to 1000 objects in a batch request.
-              // Let's batch delete them in chunks of 1000 just in case there are thousands of HLS TS chunks.
-              const chunkSize = 1000;
-              for (let i = 0; i < objectsList.length; i += chunkSize) {
-                const chunk = objectsList.slice(i, i + chunkSize);
-                await minioClient.removeObjects(bucketName, chunk);
-              }
-              console.log(`Successfully removed ${objectsList.length} objects from bucket for user ${userId}.`);
+        await new Promise((resolve, reject) => {
+          stream.on('data', (obj) => {
+            if (obj && obj.name) {
+              objectsList.push(obj.name);
             }
-            resolve();
-          } catch (err) {
-            console.error('Error removing objects for account deletion:', err);
+          });
+          stream.on('error', (err) => {
+            console.error(`Error listing objects for prefix ${prefix} during account deletion:`, err);
             reject(err);
-          }
+          });
+          stream.on('end', () => {
+            resolve();
+          });
         });
-      });
+      }
+
+      if (objectsList.length > 0) {
+        // MinIO removeObjects handles up to 1000 objects in a batch request.
+        // Let's batch delete them in chunks of 1000 just in case there are thousands of HLS TS chunks.
+        const chunkSize = 1000;
+        for (let i = 0; i < objectsList.length; i += chunkSize) {
+          const chunk = objectsList.slice(i, i + chunkSize);
+          await minioClient.removeObjects(bucketName, chunk);
+        }
+        console.log(`Successfully removed ${objectsList.length} objects from bucket for user ${userId} (prefixes: ${prefixes.join(', ')}).`);
+      }
     } catch (minioErr) {
       console.warn('MinIO object deletion encountered an issue or bucket is empty:', minioErr);
     }

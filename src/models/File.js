@@ -33,6 +33,30 @@ const fileSchema = new mongoose.Schema({
     type: String,
     default: null,
   },
+  isEncrypted: {
+    type: Boolean,
+    default: false,
+  },
+  iv: {
+    type: String,
+    default: null,
+  },
+  authTag: {
+    type: String,
+    default: null,
+  },
+  isThumbnailEncrypted: {
+    type: Boolean,
+    default: false,
+  },
+  thumbnailIv: {
+    type: String,
+    default: null,
+  },
+  thumbnailAuthTag: {
+    type: String,
+    default: null,
+  },
   isDeleted: {
     type: Boolean,
     default: false,

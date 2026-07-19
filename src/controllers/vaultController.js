@@ -7,6 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
 const { getCache, setCache, invalidateFolderCache, invalidateAllUserCache } = require('../utils/redisClient');
+const { deriveKey, encryptFile, encryptBuffer, createDecryptionStream } = require('../utils/cryptoUtils');
 
 // Helper to extract a video frame using ffmpeg
 const extractVideoThumbnail = (videoPath, outputPath) => {
@@ -221,6 +222,11 @@ const processAndSaveUploadedFile = async (owner, folderId, filePath, fileSize, o
   }
   const finalFileName = originalName;
 
+  let isEncrypted = false;
+  let fileIv = null;
+  let fileAuthTag = null;
+  const userKey = deriveKey(owner.toString());
+
   if (mimeType.startsWith('video/')) {
     const transcodeFolder = `hls_${Date.now()}`;
     const transcodeDir = path.join(__dirname, '../../temp-uploads', transcodeFolder);
@@ -254,30 +260,47 @@ const processAndSaveUploadedFile = async (owner, folderId, filePath, fileSize, o
 
       fs.rmSync(transcodeDir, { recursive: true, force: true });
     } catch (err) {
-      console.error('[Upload] Transcoding failed, falling back to raw video:', err);
-      // Fallback upload
+      console.error('[Upload] Transcoding failed, falling back to encrypted raw video:', err);
+      const tempEncPath = `${filePath}.enc`;
+      const encRes = await encryptFile(filePath, tempEncPath, userKey);
+      isEncrypted = true;
+      fileIv = encRes.iv;
+      fileAuthTag = encRes.authTag;
+
       const metaData = {
-        'Content-Type': mimeType,
+        'Content-Type': 'application/octet-stream',
         'Original-Name': encodeURIComponent(originalName),
         'Owner-Id': owner,
       };
-      await minioClient.fPutObject(bucketName, minioKey, filePath, metaData);
+      await minioClient.fPutObject(bucketName, minioKey, tempEncPath, metaData);
+      if (fs.existsSync(tempEncPath)) fs.unlinkSync(tempEncPath);
       if (fs.existsSync(transcodeDir)) {
         fs.rmSync(transcodeDir, { recursive: true, force: true });
       }
     }
   } else {
-    // Standard upload
+    // Standard upload with AES-256-GCM encryption
+    const tempEncPath = `${filePath}.enc`;
+    const encRes = await encryptFile(filePath, tempEncPath, userKey);
+    isEncrypted = true;
+    fileIv = encRes.iv;
+    fileAuthTag = encRes.authTag;
+
     const metaData = {
-      'Content-Type': mimeType,
+      'Content-Type': 'application/octet-stream',
       'Original-Name': encodeURIComponent(originalName),
       'Owner-Id': owner,
     };
-    await minioClient.fPutObject(bucketName, minioKey, filePath, metaData);
+    await minioClient.fPutObject(bucketName, minioKey, tempEncPath, metaData);
+    if (fs.existsSync(tempEncPath)) fs.unlinkSync(tempEncPath);
   }
 
   // Generate PDF thumbnail if applicable
   let thumbnailKey = null;
+  let isThumbnailEncrypted = false;
+  let thumbnailIv = null;
+  let thumbnailAuthTag = null;
+
   if (mimeType === 'application/pdf') {
     try {
       const { pdfToPng } = require('pdf-to-png-converter');
@@ -287,12 +310,17 @@ const processAndSaveUploadedFile = async (owner, folderId, filePath, fileSize, o
       });
       if (pngPages && pngPages.length > 0) {
         const pngBuffer = pngPages[0].content;
+        const encThumb = encryptBuffer(pngBuffer, userKey);
         thumbnailKey = `${userVaultFolder}/thumbnails/${Date.now()}_thumb.png`;
+        isThumbnailEncrypted = true;
+        thumbnailIv = encThumb.iv;
+        thumbnailAuthTag = encThumb.authTag;
+
         const thumbMetaData = {
-          'Content-Type': 'image/png',
+          'Content-Type': 'application/octet-stream',
           'Owner-Id': owner,
         };
-        await minioClient.putObject(bucketName, thumbnailKey, pngBuffer, pngBuffer.length, thumbMetaData);
+        await minioClient.putObject(bucketName, thumbnailKey, encThumb.encryptedBuffer, encThumb.encryptedBuffer.length, thumbMetaData);
       }
     } catch (pdfErr) {
       console.error('Failed to generate PDF thumbnail:', pdfErr);
@@ -306,12 +334,17 @@ const processAndSaveUploadedFile = async (owner, folderId, filePath, fileSize, o
       await extractVideoThumbnail(filePath, thumbTempPath);
       if (fs.existsSync(thumbTempPath)) {
         const pngBuffer = fs.readFileSync(thumbTempPath);
+        const encThumb = encryptBuffer(pngBuffer, userKey);
         thumbnailKey = `${userVaultFolder}/thumbnails/${Date.now()}_thumb.png`;
+        isThumbnailEncrypted = true;
+        thumbnailIv = encThumb.iv;
+        thumbnailAuthTag = encThumb.authTag;
+
         const thumbMetaData = {
-          'Content-Type': 'image/png',
+          'Content-Type': 'application/octet-stream',
           'Owner-Id': owner,
         };
-        await minioClient.putObject(bucketName, thumbnailKey, pngBuffer, pngBuffer.length, thumbMetaData);
+        await minioClient.putObject(bucketName, thumbnailKey, encThumb.encryptedBuffer, encThumb.encryptedBuffer.length, thumbMetaData);
         fs.unlinkSync(thumbTempPath);
       }
     } catch (videoErr) {
@@ -329,6 +362,12 @@ const processAndSaveUploadedFile = async (owner, folderId, filePath, fileSize, o
     folder: folderId,
     owner,
     thumbnailKey,
+    isEncrypted,
+    iv: fileIv,
+    authTag: fileAuthTag,
+    isThumbnailEncrypted,
+    thumbnailIv,
+    thumbnailAuthTag,
   });
 
   // Cleanup temp uploaded file safely
@@ -1058,7 +1097,13 @@ exports.streamFile = async (req, res) => {
         }
       });
 
-      dataStream.pipe(res);
+      if (file.isEncrypted && file.iv && file.authTag) {
+        const userKey = deriveKey(file.owner.toString());
+        const decipher = createDecryptionStream(userKey, file.iv, file.authTag);
+        dataStream.pipe(decipher).pipe(res);
+      } else {
+        dataStream.pipe(res);
+      }
     }
   } catch (error) {
     console.error('Server error streaming file:', error);
@@ -1420,7 +1465,13 @@ exports.streamThumbnail = async (req, res) => {
         res.status(500).end();
       }
     });
-    dataStream.pipe(res);
+    if (file.isThumbnailEncrypted && file.thumbnailIv && file.thumbnailAuthTag) {
+      const userKey = deriveKey(file.owner.toString());
+      const decipher = createDecryptionStream(userKey, file.thumbnailIv, file.thumbnailAuthTag);
+      dataStream.pipe(decipher).pipe(res);
+    } else {
+      dataStream.pipe(res);
+    }
   } catch (error) {
     console.error('Thumbnail streaming proxy error:', error);
     if (!res.headersSent) {

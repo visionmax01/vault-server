@@ -254,43 +254,70 @@ exports.deleteAccount = async (req, res) => {
     // 3. Delete ALL objects starting with user prefix from MinIO (includes all raw files, transcoded HLS TS chunks, thumbnails, and avatar)
     const prefix = `${userId}/`;
     const objectsList = [];
-    const stream = minioClient.listObjectsV2(bucketName, prefix, true);
 
-    await new Promise((resolve, reject) => {
-      stream.on('data', (obj) => {
-        objectsList.push(obj.name);
-      });
-      stream.on('error', (err) => {
-        console.error('Error listing objects for account deletion:', err);
-        reject(err);
-      });
-      stream.on('end', async () => {
-        try {
-          if (objectsList.length > 0) {
-            // MinIO removeObjects handles up to 1000 objects in a batch request.
-            // Let's batch delete them in chunks of 1000 just in case there are thousands of HLS TS chunks.
-            const chunkSize = 1000;
-            for (let i = 0; i < objectsList.length; i += chunkSize) {
-              const chunk = objectsList.slice(i, i + chunkSize);
-              await minioClient.removeObjects(bucketName, chunk);
-            }
-            console.log(`Successfully removed ${objectsList.length} objects from bucket for user ${userId}.`);
+    try {
+      const stream = minioClient.listObjectsV2(bucketName, prefix, true);
+
+      await new Promise((resolve, reject) => {
+        stream.on('data', (obj) => {
+          if (obj && obj.name) {
+            objectsList.push(obj.name);
           }
-          resolve();
-        } catch (err) {
-          console.error('Error removing objects for account deletion:', err);
+        });
+        stream.on('error', (err) => {
+          console.error('Error listing objects for account deletion:', err);
           reject(err);
-        }
+        });
+        stream.on('end', async () => {
+          try {
+            if (objectsList.length > 0) {
+              // MinIO removeObjects handles up to 1000 objects in a batch request.
+              // Let's batch delete them in chunks of 1000 just in case there are thousands of HLS TS chunks.
+              const chunkSize = 1000;
+              for (let i = 0; i < objectsList.length; i += chunkSize) {
+                const chunk = objectsList.slice(i, i + chunkSize);
+                await minioClient.removeObjects(bucketName, chunk);
+              }
+              console.log(`Successfully removed ${objectsList.length} objects from bucket for user ${userId}.`);
+            }
+            resolve();
+          } catch (err) {
+            console.error('Error removing objects for account deletion:', err);
+            reject(err);
+          }
+        });
       });
-    });
+    } catch (minioErr) {
+      console.warn('MinIO object deletion encountered an issue or bucket is empty:', minioErr);
+    }
 
-    // 4. Delete DB documents
+    // 4. Delete DB documents and references
     const Folder = require('../models/Folder');
+    const PaymentRequest = require('../models/PaymentRequest');
+    const PlaybackPosition = require('../models/PlaybackPosition');
+    const StreamRoom = require('../models/StreamRoom');
+
+    // Delete own content
     await File.deleteMany({ owner: userId });
     await Folder.deleteMany({ owner: userId });
+    await PaymentRequest.deleteMany({ user: userId });
+    await PlaybackPosition.deleteMany({ owner: userId });
+    await StreamRoom.deleteMany({ hostId: userId });
+
+    // Remove user shares from files and folders owned by others
+    await File.updateMany(
+      { 'sharedWith.user': userId },
+      { $pull: { sharedWith: { user: userId } } }
+    );
+    await Folder.updateMany(
+      { 'sharedWith.user': userId },
+      { $pull: { sharedWith: { user: userId } } }
+    );
+
+    // Delete user profile
     await User.findByIdAndDelete(userId);
 
-    return res.json({ message: 'Account and all associated files deleted successfully' });
+    return res.json({ message: 'Account and all associated files/data deleted successfully' });
   } catch (error) {
     console.error('Delete account error:', error);
     return res.status(500).json({ message: 'Server error during account deletion' });

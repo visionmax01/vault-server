@@ -855,10 +855,14 @@ exports.restoreItem = async (req, res) => {
       await item.save();
     }
 
-    // Invalidate Cache
+    // Invalidate Cache for target folder, root, and all user cache
+    if (item.folder) {
+      await invalidateFolderCache(owner, item.folder);
+    }
+    await invalidateFolderCache(owner, null);
     await invalidateAllUserCache(owner);
 
-    return res.json({ message: 'Item restored successfully', itemId, isFolder });
+    return res.json({ message: 'Item restored successfully', itemId, isFolder, targetFolder: item.folder || null });
   } catch (error) {
     console.error('Restore item error:', error);
     return res.status(500).json({ message: 'Server error restoring item' });

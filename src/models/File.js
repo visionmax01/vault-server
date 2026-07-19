@@ -51,8 +51,24 @@ const fileSchema = new mongoose.Schema({
     default: Date.now,
   },
   sharedWith: [{
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User'
+    user: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true
+    },
+    permission: {
+      type: String,
+      enum: ['view', 'edit'],
+      default: 'view'
+    },
+    viewCount: {
+      type: Number,
+      default: 0
+    },
+    lastViewed: {
+      type: Date,
+      default: null
+    }
   }]
 });
 

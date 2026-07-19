@@ -51,7 +51,7 @@ const hasAccessToFolder = async (folderId, userId) => {
   let currentFolder = await Folder.findById(folderId);
   while (currentFolder) {
     if (currentFolder.owner.toString() === userId.toString()) return true;
-    if (currentFolder.sharedWith && currentFolder.sharedWith.some(id => id.toString() === userId.toString())) {
+    if (currentFolder.sharedWith && currentFolder.sharedWith.some(s => (s.user ? s.user.toString() : s.toString()) === userId.toString())) {
       return true;
     }
     if (!currentFolder.parentFolder) break;
@@ -62,7 +62,7 @@ const hasAccessToFolder = async (folderId, userId) => {
 
 const hasAccessToFile = async (file, userId) => {
   if (file.owner.toString() === userId.toString()) return true;
-  if (file.sharedWith && file.sharedWith.some(id => id.toString() === userId.toString())) return true;
+  if (file.sharedWith && file.sharedWith.some(s => (s.user ? s.user.toString() : s.toString()) === userId.toString())) return true;
   if (file.folder) {
     return await hasAccessToFolder(file.folder, userId);
   }
@@ -106,10 +106,14 @@ exports.getContent = async (req, res) => {
     }
 
     // Fetch folders (excluding deleted)
-    const folders = await Folder.find({ owner: queryOwner, parentFolder: folderId, isDeleted: { $ne: true } }).sort({ name: 1 });
+    const folders = await Folder.find({ owner: queryOwner, parentFolder: folderId, isDeleted: { $ne: true } })
+      .populate('sharedWith.user', 'name email')
+      .sort({ name: 1 });
 
     // Fetch files (excluding deleted)
-    const files = await File.find({ owner: queryOwner, folder: folderId, isDeleted: { $ne: true } }).sort({ name: 1 });
+    const files = await File.find({ owner: queryOwner, folder: folderId, isDeleted: { $ne: true } })
+      .populate('sharedWith.user', 'name email')
+      .sort({ name: 1 });
 
     const responseData = { folders, files };
 
@@ -933,6 +937,18 @@ exports.streamFile = async (req, res) => {
       return res.status(403).json({ message: 'Unauthorized access to this file' });
     }
 
+    // Track shared user views (excluding seg requests)
+    if (file.owner.toString() !== owner.toString() && (!filename || filename === file.name)) {
+      const share = file.sharedWith?.find(s => (s.user ? s.user.toString() : s.toString()) === owner.toString());
+      if (share && typeof share === 'object') {
+        share.viewCount = (share.viewCount || 0) + 1;
+        share.lastViewed = new Date();
+        file.markModified('sharedWith');
+        await file.save();
+        await invalidateAllUserCache(file.owner.toString());
+      }
+    }
+
     if (file.mimeType === 'application/x-mpegURL' && filename) {
       // Stream sub-assets (HLS playlists and segment files)
       const baseDir = path.posix.dirname(file.key);
@@ -1216,9 +1232,24 @@ exports.updateFolder = async (req, res) => {
     const { name, parentFolderId } = req.body;
     const owner = req.user.id;
 
-    const folder = await Folder.findOne({ _id: folderId, owner });
-    if (!folder) {
-      return res.status(404).json({ message: 'Folder not found or unauthorized' });
+    const folder = await Folder.findById(folderId);
+    if (!folder || folder.isDeleted) {
+      return res.status(404).json({ message: 'Folder not found' });
+    }
+
+    let hasEditAccess = false;
+    let actualOwnerId = folder.owner;
+    if (folder.owner.toString() === owner.toString()) {
+      hasEditAccess = true;
+    } else {
+      const share = folder.sharedWith?.find(s => (s.user ? s.user.toString() : s.toString()) === owner.toString());
+      if (share && share.permission === 'edit') {
+        hasEditAccess = true;
+      }
+    }
+
+    if (!hasEditAccess) {
+      return res.status(403).json({ message: 'Folder not found or unauthorized' });
     }
 
     if (name !== undefined) {
@@ -1232,7 +1263,7 @@ exports.updateFolder = async (req, res) => {
       
       // Prevent naming a folder to its own name if it's in the same parent (no-op)
       if (trimmedName.toLowerCase() !== folder.name.toLowerCase() || targetParent !== folder.parentFolder) {
-        const duplicate = await Folder.findOne({ name: trimmedName, parentFolder: targetParent, owner, isDeleted: { $ne: true } });
+        const duplicate = await Folder.findOne({ name: trimmedName, parentFolder: targetParent, owner: actualOwnerId, isDeleted: { $ne: true } });
         if (duplicate) {
           return res.status(400).json({ message: 'A folder with this name already exists in the target directory' });
         }
@@ -1271,8 +1302,11 @@ exports.updateFolder = async (req, res) => {
 
     await folder.save();
 
-    // Invalidate Cache
+    // Invalidate Cache for edit-user and actual owner
     await invalidateAllUserCache(owner);
+    if (owner !== actualOwnerId.toString()) {
+      await invalidateAllUserCache(actualOwnerId.toString());
+    }
 
     return res.json(folder);
   } catch (error) {
@@ -1288,9 +1322,24 @@ exports.updateFile = async (req, res) => {
     const { name, folderId } = req.body;
     const owner = req.user.id;
 
-    const file = await File.findOne({ _id: fileId, owner });
-    if (!file) {
-      return res.status(404).json({ message: 'File not found or unauthorized' });
+    const file = await File.findById(fileId);
+    if (!file || file.isDeleted) {
+      return res.status(404).json({ message: 'File not found' });
+    }
+
+    let hasEditAccess = false;
+    let actualOwnerId = file.owner;
+    if (file.owner.toString() === owner.toString()) {
+      hasEditAccess = true;
+    } else {
+      const share = file.sharedWith?.find(s => (s.user ? s.user.toString() : s.toString()) === owner.toString());
+      if (share && share.permission === 'edit') {
+        hasEditAccess = true;
+      }
+    }
+
+    if (!hasEditAccess) {
+      return res.status(403).json({ message: 'File not found or unauthorized' });
     }
 
     const originalFolderId = file.folder;
@@ -1304,7 +1353,7 @@ exports.updateFile = async (req, res) => {
       const targetFolder = folderId !== undefined ? (folderId === 'null' ? null : folderId) : file.folder;
 
       if (trimmedName.toLowerCase() !== file.name.toLowerCase() || targetFolder !== file.folder) {
-        const duplicate = await File.findOne({ name: trimmedName, folder: targetFolder, owner, isDeleted: { $ne: true } });
+        const duplicate = await File.findOne({ name: trimmedName, folder: targetFolder, owner: actualOwnerId, isDeleted: { $ne: true } });
         if (duplicate) {
           return res.status(400).json({ message: 'A file with this name already exists in the target directory' });
         }
@@ -1323,10 +1372,16 @@ exports.updateFile = async (req, res) => {
 
     await file.save();
 
-    // Invalidate Cache for old and new parent folder
+    // Invalidate Cache for old and new parent folder for both users
     await invalidateFolderCache(owner, originalFolderId);
     if (folderId !== undefined) {
       await invalidateFolderCache(owner, file.folder);
+    }
+    if (owner !== actualOwnerId.toString()) {
+      await invalidateFolderCache(actualOwnerId.toString(), originalFolderId);
+      if (folderId !== undefined) {
+        await invalidateFolderCache(actualOwnerId.toString(), file.folder);
+      }
     }
 
     return res.json(file);
@@ -1623,7 +1678,7 @@ exports.bulkMove = async (req, res) => {
 exports.shareItem = async (req, res) => {
   try {
     const owner = req.user.id;
-    const { itemId, itemType, email } = req.body;
+    const { itemId, itemType, email, permission } = req.body;
 
     if (!itemId || !itemType || !email) {
       return res.status(400).json({ message: 'itemId, itemType, and email are required' });
@@ -1643,15 +1698,30 @@ exports.shareItem = async (req, res) => {
       return res.status(400).json({ message: 'You cannot share items with yourself' });
     }
 
+    const sharePermission = (permission === 'edit') ? 'edit' : 'view';
+
     if (itemType === 'folder') {
       const folder = await Folder.findOne({ _id: itemId, owner });
       if (!folder) {
         return res.status(404).json({ message: 'Folder not found or unauthorized' });
       }
 
-      if (!folder.sharedWith.includes(targetUser._id)) {
-        folder.sharedWith.push(targetUser._id);
-        await folder.save();
+      const existingShareIdx = folder.sharedWith.findIndex(s => (s.user ? s.user.toString() : s.toString()) === targetUser._id.toString());
+      if (permission === 'remove' || permission === 'revoke') {
+        if (existingShareIdx !== -1) {
+          folder.sharedWith.splice(existingShareIdx, 1);
+          await folder.save();
+        }
+      } else {
+        if (existingShareIdx !== -1) {
+          folder.sharedWith[existingShareIdx].permission = sharePermission;
+          folder.sharedWith[existingShareIdx].user = targetUser._id;
+          folder.markModified('sharedWith');
+          await folder.save();
+        } else {
+          folder.sharedWith.push({ user: targetUser._id, permission: sharePermission });
+          await folder.save();
+        }
       }
     } else {
       const file = await File.findOne({ _id: itemId, owner });
@@ -1659,16 +1729,30 @@ exports.shareItem = async (req, res) => {
         return res.status(404).json({ message: 'File not found or unauthorized' });
       }
 
-      if (!file.sharedWith.includes(targetUser._id)) {
-        file.sharedWith.push(targetUser._id);
-        await file.save();
+      const existingShareIdx = file.sharedWith.findIndex(s => (s.user ? s.user.toString() : s.toString()) === targetUser._id.toString());
+      if (permission === 'remove' || permission === 'revoke') {
+        if (existingShareIdx !== -1) {
+          file.sharedWith.splice(existingShareIdx, 1);
+          await file.save();
+        }
+      } else {
+        if (existingShareIdx !== -1) {
+          file.sharedWith[existingShareIdx].permission = sharePermission;
+          file.sharedWith[existingShareIdx].user = targetUser._id;
+          file.markModified('sharedWith');
+          await file.save();
+        } else {
+          file.sharedWith.push({ user: targetUser._id, permission: sharePermission });
+          await file.save();
+        }
       }
     }
 
     // Invalidate recipient's cache to show new item instantly
     await invalidateAllUserCache(targetUser._id.toString());
+    await invalidateAllUserCache(owner);
 
-    return res.json({ success: true, message: `Item shared successfully with ${targetUser.name}` });
+    return res.json({ success: true, message: `Item sharing updated successfully` });
   } catch (error) {
     console.error('Share item error:', error);
     return res.status(500).json({ message: 'Server error sharing item' });
@@ -1680,13 +1764,27 @@ exports.getSharedContent = async (req, res) => {
     const userId = req.user.id;
 
     // Fetch folders shared with current user
-    const folders = await Folder.find({ sharedWith: userId, isDeleted: { $ne: true } })
+    const folders = await Folder.find({
+      $or: [
+        { sharedWith: userId },
+        { 'sharedWith.user': userId }
+      ],
+      isDeleted: { $ne: true }
+    })
       .populate('owner', 'name email')
+      .populate('sharedWith.user', 'name email')
       .sort({ name: 1 });
 
     // Fetch files shared with current user
-    const files = await File.find({ sharedWith: userId, isDeleted: { $ne: true } })
+    const files = await File.find({
+      $or: [
+        { sharedWith: userId },
+        { 'sharedWith.user': userId }
+      ],
+      isDeleted: { $ne: true }
+    })
       .populate('owner', 'name email')
+      .populate('sharedWith.user', 'name email')
       .sort({ name: 1 });
 
     return res.json({ folders, files });

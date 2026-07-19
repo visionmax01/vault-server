@@ -46,6 +46,10 @@ router.post('/terminate-stream', streamController.terminateStream);
 // @desc    Get stream room history for current user
 router.get('/stream-history', streamController.getStreamHistory);
 
+// @route   GET api/vault/recent
+// @desc    Get recent files across all folders
+router.get('/recent', vaultController.getRecentFiles);
+
 // @route   GET api/vault/content
 // @desc    Get files and folders in directory
 router.get('/content', vaultController.getContent);
@@ -71,12 +75,28 @@ router.post('/files/upload-chunk', upload.single('file'), vaultController.upload
 router.post('/files/upload-cancel', vaultController.cancelUpload);
 
 // @route   DELETE api/vault/files/:fileId
-// @desc    Delete file from vault and MinIO
+// @desc    Delete file from vault and MinIO (soft-delete)
 router.delete('/files/:fileId', vaultController.deleteFile);
 
 // @route   DELETE api/vault/folders/:folderId
-// @desc    Delete folder and nested elements recursively
+// @desc    Delete folder and nested elements recursively (soft-delete)
 router.delete('/folders/:folderId', vaultController.deleteFolder);
+
+// @route   GET api/vault/trash
+// @desc    Get all explicitly soft-deleted items
+router.get('/trash', vaultController.getTrash);
+
+// @route   POST api/vault/trash/restore/:itemId
+// @desc    Restore item from Trash
+router.post('/trash/restore/:itemId', vaultController.restoreItem);
+
+// @route   DELETE api/vault/trash/permanent/:itemId
+// @desc    Permanently delete folder/file from DB and MinIO
+router.delete('/trash/permanent/:itemId', vaultController.permanentlyDeleteItem);
+
+// @route   POST api/vault/trash/clear
+// @desc    Empty user trash bin
+router.post('/trash/clear', vaultController.clearTrash);
 
 // @route   GET api/vault/folders/:folderId/size
 // @desc    Get folder size recursively including all files
@@ -105,6 +125,18 @@ router.patch('/folders/:folderId', vaultController.updateFolder);
 // @route   PATCH api/vault/files/:fileId
 // @desc    Rename or move a file
 router.patch('/files/:fileId', vaultController.updateFile);
+
+// @route   POST api/vault/playback/resume
+// @desc    Save or update playback progress
+router.post('/playback/resume', vaultController.savePlaybackPosition);
+
+// @route   GET api/vault/playback/resume
+// @desc    Get playback progress for a file
+router.get('/playback/resume', vaultController.getPlaybackPosition);
+
+// @route   POST api/vault/bulk-move
+// @desc    Move multiple files and folders to a target parent folder
+router.post('/bulk-move', vaultController.bulkMove);
 
 // @route   GET api/vault/files/thumbnail/:fileId
 // @desc    Stream file thumbnail image

@@ -16,13 +16,26 @@ const folderSchema = new mongoose.Schema({
     ref: 'User',
     required: true,
   },
+  isDeleted: {
+    type: Boolean,
+    default: false,
+  },
+  deletedAt: {
+    type: Date,
+    default: null,
+  },
+  deletedParent: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Folder',
+    default: null,
+  },
   createdAt: {
     type: Date,
     default: Date.now,
   }
 });
 
-// Compound index to ensure uniqueness of folder names within the same parent folder for a given user
-folderSchema.index({ name: 1, parentFolder: 1, owner: 1 }, { unique: true });
+// Compound index to help query performance
+folderSchema.index({ name: 1, parentFolder: 1, owner: 1 });
 
 module.exports = mongoose.model('Folder', folderSchema);

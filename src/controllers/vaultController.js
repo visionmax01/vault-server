@@ -6,6 +6,7 @@ const { minioClient, bucketName } = require('../config/minio');
 const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
+const { getCache, setCache, invalidateFolderCache, invalidateAllUserCache } = require('../utils/redisClient');
 
 // Helper to extract a video frame using ffmpeg
 const extractVideoThumbnail = (videoPath, outputPath) => {
@@ -56,16 +57,41 @@ exports.getContent = async (req, res) => {
       folderId = null;
     }
 
-    // Fetch folders
-    const folders = await Folder.find({ owner, parentFolder: folderId }).sort({ name: 1 });
+    const cacheKey = `vault:content:${owner}:${folderId || 'root'}`;
 
-    // Fetch files
-    const files = await File.find({ owner, folder: folderId }).sort({ name: 1 });
+    // Try reading from cache
+    const cachedData = await getCache(cacheKey);
+    if (cachedData) {
+      return res.json(cachedData);
+    }
 
-    return res.json({ folders, files });
+    // Fetch folders (excluding deleted)
+    const folders = await Folder.find({ owner, parentFolder: folderId, isDeleted: { $ne: true } }).sort({ name: 1 });
+
+    // Fetch files (excluding deleted)
+    const files = await File.find({ owner, folder: folderId, isDeleted: { $ne: true } }).sort({ name: 1 });
+
+    const responseData = { folders, files };
+
+    // Cache in Redis for 1 hour (3600 seconds)
+    await setCache(cacheKey, responseData, 3600);
+
+    return res.json(responseData);
   } catch (error) {
     console.error('Get vault content error:', error);
     return res.status(500).json({ message: 'Server error retrieving vault contents' });
+  }
+};
+
+// 1b. Get recent files across all folders
+exports.getRecentFiles = async (req, res) => {
+  try {
+    const owner = req.user.id;
+    const files = await File.find({ owner, isDeleted: { $ne: true } }).sort({ createdAt: -1 }).limit(20);
+    return res.json({ files });
+  } catch (error) {
+    console.error('Get recent files error:', error);
+    return res.status(500).json({ message: 'Server error retrieving recent files' });
   }
 };
 
@@ -81,8 +107,8 @@ exports.createFolder = async (req, res) => {
 
     const folderParent = parentFolderId && parentFolderId !== 'null' ? parentFolderId : null;
 
-    // Check for duplicate folder name inside same directory
-    const duplicate = await Folder.findOne({ name: name.trim(), parentFolder: folderParent, owner });
+    // Check for duplicate folder name inside same directory (excluding deleted ones)
+    const duplicate = await Folder.findOne({ name: name.trim(), parentFolder: folderParent, owner, isDeleted: { $ne: true } });
     if (duplicate) {
       return res.status(400).json({ message: 'A folder with this name already exists here' });
     }
@@ -92,6 +118,9 @@ exports.createFolder = async (req, res) => {
       parentFolder: folderParent,
       owner,
     });
+
+    // Invalidate Cache for parent folder
+    await invalidateFolderCache(owner, folderParent);
 
     return res.status(201).json(folder);
   } catch (error) {
@@ -140,8 +169,8 @@ const processAndSaveUploadedFile = async (owner, folderId, filePath, fileSize, o
   let finalMimeType = mimeType;
   let finalKey = minioKey;
 
-  // Verify name duplication inside the same folder for this owner
-  const duplicate = await File.findOne({ name: originalName, folder: folderId, owner });
+  // Verify name duplication inside the same folder for this owner (excluding deleted ones)
+  const duplicate = await File.findOne({ name: originalName, folder: folderId, owner, isDeleted: { $ne: true } });
   if (duplicate) {
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
     throw new Error(`A file named "${originalName}" is already uploaded in this folder.`);
@@ -262,6 +291,9 @@ const processAndSaveUploadedFile = async (owner, folderId, filePath, fileSize, o
   if (fs.existsSync(filePath)) {
     fs.unlinkSync(filePath);
   }
+
+  // Invalidate Cache for parent folder
+  await invalidateFolderCache(owner, folderId);
 
   return file;
 };
@@ -457,7 +489,133 @@ exports.uploadChunk = async (req, res) => {
   }
 };
 
-// 4. Delete file
+// Reusable helper to permanently delete a file from DB, MinIO, and associated Movies
+const permanentlyDeleteFile = async (fileId, owner) => {
+  const file = await File.findOne({ _id: fileId, owner });
+  if (!file) return;
+
+  // Delete object(s) from MinIO
+  if (file.mimeType === 'application/x-mpegURL') {
+    const prefix = path.posix.dirname(file.key) + '/';
+    const objectsList = [];
+    const stream = minioClient.listObjectsV2(bucketName, prefix, true);
+
+    await new Promise((resolve, reject) => {
+      stream.on('data', (obj) => {
+        objectsList.push(obj.name);
+      });
+      stream.on('error', (err) => reject(err));
+      stream.on('end', async () => {
+        try {
+          if (objectsList.length > 0) {
+            await minioClient.removeObjects(bucketName, objectsList);
+          }
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+  } else {
+    await minioClient.removeObject(bucketName, file.key);
+  }
+
+  // Delete thumbnail if it exists
+  if (file.thumbnailKey) {
+    await minioClient.removeObject(bucketName, file.thumbnailKey).catch(err => {
+      console.warn('Failed to clean up thumbnail from MinIO:', err);
+    });
+  }
+
+  // Delete any associated public Movie record
+  const Movie = require('../models/Movie');
+  const movie = await Movie.findOne({ videoKey: file.key });
+  if (movie) {
+    if (movie.posterKey && movie.posterKey !== file.thumbnailKey) {
+      await minioClient.removeObject(bucketName, movie.posterKey).catch(err => {
+        console.warn('Failed to clean up movie poster from MinIO:', err);
+      });
+    }
+    await Movie.deleteOne({ _id: movie._id });
+  }
+
+  // Delete from DB
+  await File.deleteOne({ _id: fileId });
+};
+
+// Reusable helper to permanently delete a folder recursively
+const permanentlyDeleteFolder = async (folderId, owner) => {
+  const folder = await Folder.findOne({ _id: folderId, owner });
+  if (!folder) return;
+
+  // Recursive helper to gather all sub-folders and files
+  const gatherAllFolderContents = async (currentId, foldersAccumulator, filesAccumulator) => {
+    // Find sub-folders
+    const subfolders = await Folder.find({ owner, parentFolder: currentId });
+    for (const sub of subfolders) {
+      foldersAccumulator.push(sub);
+      await gatherAllFolderContents(sub._id, foldersAccumulator, filesAccumulator);
+    }
+    // Find files
+    const files = await File.find({ owner, folder: currentId });
+    for (const file of files) {
+      filesAccumulator.push(file);
+    }
+  };
+
+  const allFolders = [folder];
+  const allFiles = [];
+
+  await gatherAllFolderContents(folderId, allFolders, allFiles);
+
+  // Delete MinIO objects
+  if (allFiles.length > 0) {
+    const keys = [];
+    for (const f of allFiles) {
+      if (f.mimeType === 'application/x-mpegURL') {
+        const hlsKeys = await getHlsSubKeys(f.key);
+        keys.push(...hlsKeys);
+      } else {
+        keys.push(f.key);
+      }
+      if (f.thumbnailKey && !keys.includes(f.thumbnailKey)) {
+        keys.push(f.thumbnailKey);
+      }
+    }
+    if (keys.length > 0) {
+      await minioClient.removeObjects(bucketName, keys);
+    }
+
+    // Delete any associated public Movie records
+    const fileKeys = allFiles.map(f => f.key);
+    const Movie = require('../models/Movie');
+    const movies = await Movie.find({ videoKey: { $in: fileKeys } });
+    if (movies.length > 0) {
+      for (const movie of movies) {
+        if (movie.posterKey && !keys.includes(movie.posterKey)) {
+          await minioClient.removeObject(bucketName, movie.posterKey).catch(err => {
+            console.warn('Failed to clean up movie poster from MinIO:', err);
+          });
+        }
+      }
+      await Movie.deleteMany({ videoKey: { $in: fileKeys } });
+    }
+
+    // Delete files from DB
+    const fileIds = allFiles.map(f => f._id);
+    await File.deleteMany({ _id: { $in: fileIds } });
+  }
+
+  // Delete folders from DB
+  const folderIds = allFolders.map(f => f._id);
+  await Folder.deleteMany({ _id: { $in: folderIds } });
+};
+
+// Export helpers for the trash pruning worker
+exports.permanentlyDeleteFileHelper = permanentlyDeleteFile;
+exports.permanentlyDeleteFolderHelper = permanentlyDeleteFolder;
+
+// 4. Delete file (soft-delete, moves to trash)
 exports.deleteFile = async (req, res) => {
   try {
     const { fileId } = req.params;
@@ -468,62 +626,23 @@ exports.deleteFile = async (req, res) => {
       return res.status(404).json({ message: 'File not found or unauthorized' });
     }
 
-    // Delete object(s) from MinIO
-    if (file.mimeType === 'application/x-mpegURL') {
-      const prefix = path.posix.dirname(file.key) + '/';
-      const objectsList = [];
-      const stream = minioClient.listObjectsV2(bucketName, prefix, true);
+    // Soft delete
+    file.isDeleted = true;
+    file.deletedAt = new Date();
+    file.deletedParent = null; // Explicit deletion
+    await file.save();
 
-      await new Promise((resolve, reject) => {
-        stream.on('data', (obj) => {
-          objectsList.push(obj.name);
-        });
-        stream.on('error', (err) => reject(err));
-        stream.on('end', async () => {
-          try {
-            if (objectsList.length > 0) {
-              await minioClient.removeObjects(bucketName, objectsList);
-            }
-            resolve();
-          } catch (err) {
-            reject(err);
-          }
-        });
-      });
-    } else {
-      await minioClient.removeObject(bucketName, file.key);
-    }
+    // Invalidate Cache for parent folder
+    await invalidateFolderCache(owner, file.folder);
 
-    // Delete thumbnail if it exists
-    if (file.thumbnailKey) {
-      await minioClient.removeObject(bucketName, file.thumbnailKey).catch(err => {
-        console.warn('Failed to clean up thumbnail from MinIO:', err);
-      });
-    }
-
-    // Delete any associated public Movie record
-    const Movie = require('../models/Movie');
-    const movie = await Movie.findOne({ videoKey: file.key });
-    if (movie) {
-      if (movie.posterKey && movie.posterKey !== file.thumbnailKey) {
-        await minioClient.removeObject(bucketName, movie.posterKey).catch(err => {
-          console.warn('Failed to clean up movie poster from MinIO:', err);
-        });
-      }
-      await Movie.deleteOne({ _id: movie._id });
-    }
-
-    // Delete from DB
-    await File.deleteOne({ _id: fileId });
-
-    return res.json({ message: 'File deleted successfully', fileId });
+    return res.json({ message: 'File moved to Trash successfully', fileId });
   } catch (error) {
-    console.error('Delete file error:', error);
-    return res.status(500).json({ message: 'Server error deleting file' });
+    console.error('Soft delete file error:', error);
+    return res.status(500).json({ message: 'Server error moving file to Trash' });
   }
 };
 
-// 5. Delete folder recursively (deletes all nested folders and files)
+// 5. Delete folder recursively (soft-delete folder and nested items)
 exports.deleteFolder = async (req, res) => {
   try {
     const { folderId } = req.params;
@@ -534,72 +653,193 @@ exports.deleteFolder = async (req, res) => {
       return res.status(404).json({ message: 'Folder not found or unauthorized' });
     }
 
-    // Recursive helper to gather all sub-folders and files
-    const gatherAllFolderContents = async (currentId, foldersAccumulator, filesAccumulator) => {
-      // Find sub-folders
-      const subfolders = await Folder.find({ owner, parentFolder: currentId });
+    // Recursive helper to soft-delete all nested items
+    const softDeleteFolderContents = async (currentId, parentId) => {
+      // Soft-delete nested folders
+      const subfolders = await Folder.find({ owner, parentFolder: currentId, isDeleted: { $ne: true } });
       for (const sub of subfolders) {
-        foldersAccumulator.push(sub);
-        await gatherAllFolderContents(sub._id, foldersAccumulator, filesAccumulator);
+        sub.isDeleted = true;
+        sub.deletedAt = new Date();
+        sub.deletedParent = parentId;
+        await sub.save();
+        await softDeleteFolderContents(sub._id, parentId);
       }
-      // Find files
-      const files = await File.find({ owner, folder: currentId });
+      // Soft-delete nested files
+      const files = await File.find({ owner, folder: currentId, isDeleted: { $ne: true } });
       for (const file of files) {
-        filesAccumulator.push(file);
+        file.isDeleted = true;
+        file.deletedAt = new Date();
+        file.deletedParent = parentId;
+        await file.save();
       }
     };
 
-    const allFolders = [folder];
-    const allFiles = [];
+    // Soft delete target folder itself
+    folder.isDeleted = true;
+    folder.deletedAt = new Date();
+    folder.deletedParent = null; // Explicit deletion
+    await folder.save();
 
-    await gatherAllFolderContents(folderId, allFolders, allFiles);
+    // Soft delete all nested items
+    await softDeleteFolderContents(folderId, folderId);
 
-    // Delete MinIO objects
-    if (allFiles.length > 0) {
-      const keys = [];
-      for (const f of allFiles) {
-        if (f.mimeType === 'application/x-mpegURL') {
-          const hlsKeys = await getHlsSubKeys(f.key);
-          keys.push(...hlsKeys);
-        } else {
-          keys.push(f.key);
-        }
-        if (f.thumbnailKey && !keys.includes(f.thumbnailKey)) {
-          keys.push(f.thumbnailKey);
-        }
-      }
-      if (keys.length > 0) {
-        await minioClient.removeObjects(bucketName, keys);
-      }
+    // Invalidate Cache for parent folder and sub-items
+    await invalidateFolderCache(owner, folder.parentFolder);
+    await invalidateAllUserCache(owner);
 
-      // Delete any associated public Movie records
-      const fileKeys = allFiles.map(f => f.key);
-      const Movie = require('../models/Movie');
-      const movies = await Movie.find({ videoKey: { $in: fileKeys } });
-      if (movies.length > 0) {
-        for (const movie of movies) {
-          if (movie.posterKey && !keys.includes(movie.posterKey)) {
-            await minioClient.removeObject(bucketName, movie.posterKey).catch(err => {
-              console.warn('Failed to clean up movie poster from MinIO:', err);
-            });
-          }
-        }
-        await Movie.deleteMany({ videoKey: { $in: fileKeys } });
-      }
+    return res.json({ message: 'Folder moved to Trash successfully', folderId });
+  } catch (error) {
+    console.error('Soft delete folder error:', error);
+    return res.status(500).json({ message: 'Server error moving folder to Trash' });
+  }
+};
 
-      // Delete files from DB
-      const fileIds = allFiles.map(f => f._id);
-      await File.deleteMany({ _id: { $in: fileIds } });
+// 5b. Get Trash content (items soft-deleted explicitly by user)
+exports.getTrash = async (req, res) => {
+  try {
+    const owner = req.user.id;
+
+    const folders = await Folder.find({ owner, isDeleted: true, deletedParent: null }).sort({ deletedAt: -1 });
+    const files = await File.find({ owner, isDeleted: true, deletedParent: null }).sort({ deletedAt: -1 });
+
+    return res.json({ folders, files });
+  } catch (error) {
+    console.error('Get trash error:', error);
+    return res.status(500).json({ message: 'Server error retrieving trash items' });
+  }
+};
+
+// 5c. Restore item from Trash
+exports.restoreItem = async (req, res) => {
+  try {
+    const { itemId } = req.params;
+    const owner = req.user.id;
+
+    // Try finding folder first
+    let isFolder = true;
+    let item = await Folder.findOne({ _id: itemId, owner });
+    if (!item) {
+      isFolder = false;
+      item = await File.findOne({ _id: itemId, owner });
     }
 
-    // Delete folders from DB
-    const folderIds = allFolders.map(f => f._id);
-    await Folder.deleteMany({ _id: { $in: folderIds } });
+    if (!item) {
+      return res.status(404).json({ message: 'Item not found in Trash or unauthorized' });
+    }
 
-    return res.json({ message: 'Folder and all its contents deleted recursively', folderId });
+    if (isFolder) {
+      // Restore folder itself
+      item.isDeleted = false;
+      item.deletedAt = null;
+      item.deletedParent = null;
+      await item.save();
+
+      // Recursively restore all items that were deleted as part of this folder
+      const restoreFolderContents = async (currentId) => {
+        // Find subfolders deleted as part of this root deletion
+        const subfolders = await Folder.find({ owner, parentFolder: currentId, deletedParent: itemId });
+        for (const sub of subfolders) {
+          sub.isDeleted = false;
+          sub.deletedAt = null;
+          sub.deletedParent = null;
+          await sub.save();
+          await restoreFolderContents(sub._id);
+        }
+        // Find files deleted as part of this root deletion
+        const files = await File.find({ owner, folder: currentId, deletedParent: itemId });
+        for (const file of files) {
+          file.isDeleted = false;
+          file.deletedAt = null;
+          file.deletedParent = null;
+          await file.save();
+        }
+      };
+
+      await restoreFolderContents(itemId);
+    } else {
+      // Restore single file
+      // If the file's original parent folder is still in trash (or doesn't exist), move it to root
+      if (item.folder) {
+        const parent = await Folder.findOne({ _id: item.folder, owner });
+        if (!parent || parent.isDeleted) {
+          item.folder = null;
+        }
+      }
+
+      item.isDeleted = false;
+      item.deletedAt = null;
+      item.deletedParent = null;
+      await item.save();
+    }
+
+    // Invalidate Cache
+    await invalidateAllUserCache(owner);
+
+    return res.json({ message: 'Item restored successfully', itemId, isFolder });
   } catch (error) {
-    console.error('Recursive delete folder error:', error);
-    return res.status(500).json({ message: 'Server error deleting folder recursively' });
+    console.error('Restore item error:', error);
+    return res.status(500).json({ message: 'Server error restoring item' });
+  }
+};
+
+// 5d. Permanently delete individual item from Trash
+exports.permanentlyDeleteItem = async (req, res) => {
+  try {
+    const { itemId } = req.params;
+    const owner = req.user.id;
+
+    // Check if it's a folder or file
+    let isFolder = true;
+    let item = await Folder.findOne({ _id: itemId, owner });
+    if (!item) {
+      isFolder = false;
+      item = await File.findOne({ _id: itemId, owner });
+    }
+
+    if (!item) {
+      return res.status(404).json({ message: 'Item not found in Trash or unauthorized' });
+    }
+
+    if (isFolder) {
+      await permanentlyDeleteFolder(itemId, owner);
+    } else {
+      await permanentlyDeleteFile(itemId, owner);
+    }
+
+    // Invalidate Cache
+    await invalidateAllUserCache(owner);
+
+    return res.json({ message: 'Item permanently deleted from storage and DB', itemId, isFolder });
+  } catch (error) {
+    console.error('Permanent delete error:', error);
+    return res.status(500).json({ message: 'Server error permanently deleting item' });
+  }
+};
+
+// 5e. Clear all items from Trash (Empty Bin)
+exports.clearTrash = async (req, res) => {
+  try {
+    const owner = req.user.id;
+
+    // Find all explicitly deleted top-level folders and files
+    const folders = await Folder.find({ owner, isDeleted: true, deletedParent: null });
+    const files = await File.find({ owner, isDeleted: true, deletedParent: null });
+
+    for (const folder of folders) {
+      await permanentlyDeleteFolder(folder._id, owner);
+    }
+
+    for (const file of files) {
+      await permanentlyDeleteFile(file._id, owner);
+    }
+
+    // Invalidate Cache
+    await invalidateAllUserCache(owner);
+
+    return res.json({ message: 'Trash bin cleared successfully' });
+  } catch (error) {
+    console.error('Clear trash error:', error);
+    return res.status(500).json({ message: 'Server error clearing trash bin' });
   }
 };
 
@@ -947,7 +1187,7 @@ exports.updateFolder = async (req, res) => {
       
       // Prevent naming a folder to its own name if it's in the same parent (no-op)
       if (trimmedName.toLowerCase() !== folder.name.toLowerCase() || targetParent !== folder.parentFolder) {
-        const duplicate = await Folder.findOne({ name: trimmedName, parentFolder: targetParent, owner });
+        const duplicate = await Folder.findOne({ name: trimmedName, parentFolder: targetParent, owner, isDeleted: { $ne: true } });
         if (duplicate) {
           return res.status(400).json({ message: 'A folder with this name already exists in the target directory' });
         }
@@ -985,6 +1225,10 @@ exports.updateFolder = async (req, res) => {
     }
 
     await folder.save();
+
+    // Invalidate Cache
+    await invalidateAllUserCache(owner);
+
     return res.json(folder);
   } catch (error) {
     console.error('Update folder error:', error);
@@ -1004,6 +1248,8 @@ exports.updateFile = async (req, res) => {
       return res.status(404).json({ message: 'File not found or unauthorized' });
     }
 
+    const originalFolderId = file.folder;
+
     if (name !== undefined) {
       const trimmedName = name.trim();
       if (!trimmedName) {
@@ -1013,7 +1259,7 @@ exports.updateFile = async (req, res) => {
       const targetFolder = folderId !== undefined ? (folderId === 'null' ? null : folderId) : file.folder;
 
       if (trimmedName.toLowerCase() !== file.name.toLowerCase() || targetFolder !== file.folder) {
-        const duplicate = await File.findOne({ name: trimmedName, folder: targetFolder, owner });
+        const duplicate = await File.findOne({ name: trimmedName, folder: targetFolder, owner, isDeleted: { $ne: true } });
         if (duplicate) {
           return res.status(400).json({ message: 'A file with this name already exists in the target directory' });
         }
@@ -1031,6 +1277,13 @@ exports.updateFile = async (req, res) => {
     }
 
     await file.save();
+
+    // Invalidate Cache for old and new parent folder
+    await invalidateFolderCache(owner, originalFolderId);
+    if (folderId !== undefined) {
+      await invalidateFolderCache(owner, file.folder);
+    }
+
     return res.json(file);
   } catch (error) {
     console.error('Update file error:', error);
@@ -1173,6 +1426,147 @@ exports.streamAvatar = async (req, res) => {
     if (!res.headersSent) {
       return res.status(500).json({ message: 'Server error streaming profile avatar' });
     }
+  }
+};
+
+const PlaybackPosition = require('../models/PlaybackPosition');
+
+// 13. Save or update playback progress position
+exports.savePlaybackPosition = async (req, res) => {
+  try {
+    const owner = req.user.id;
+    const { filePath, currentTime, duration } = req.body;
+
+    if (!filePath || currentTime === undefined || !duration) {
+      return res.status(400).json({ message: 'filePath, currentTime, and duration are required' });
+    }
+
+    // Upsert database record
+    await PlaybackPosition.findOneAndUpdate(
+      { owner, filePath },
+      { currentTime, duration, updatedAt: new Date() },
+      { upsert: true, new: true }
+    );
+
+    // Cache in Redis for 1 day
+    const cacheKey = `vault:playback:${owner}:${filePath}`;
+    await setCache(cacheKey, { currentTime, duration }, 86400);
+
+    return res.json({ success: true, message: 'Playback progress saved successfully' });
+  } catch (error) {
+    console.error('Save playback position error:', error);
+    return res.status(500).json({ message: 'Server error saving playback position' });
+  }
+};
+
+// 14. Get playback progress position for a file
+exports.getPlaybackPosition = async (req, res) => {
+  try {
+    const owner = req.user.id;
+    const { filePath } = req.query;
+
+    if (!filePath) {
+      return res.status(400).json({ message: 'filePath is required' });
+    }
+
+    const cacheKey = `vault:playback:${owner}:${filePath}`;
+
+    // Try reading from Redis cache
+    const cached = await getCache(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    // Fetch from MongoDB
+    const position = await PlaybackPosition.findOne({ owner, filePath });
+    if (!position) {
+      return res.json({ currentTime: 0, duration: 0 });
+    }
+
+    const result = { currentTime: position.currentTime, duration: position.duration };
+    // Cache the hit
+    await setCache(cacheKey, result, 86400);
+
+    return res.json(result);
+  } catch (error) {
+    console.error('Get playback position error:', error);
+    return res.status(500).json({ message: 'Server error retrieving playback position' });
+  }
+};
+
+// 15. Move multiple folders and files to targetFolderId
+exports.bulkMove = async (req, res) => {
+  try {
+    const owner = req.user.id;
+    const { folderIds, fileIds, targetFolderId } = req.body;
+
+    const targetFolder = targetFolderId === 'null' || !targetFolderId ? null : targetFolderId;
+
+    // Verify target parent exists if not root
+    if (targetFolder) {
+      const parentExist = await Folder.findOne({ _id: targetFolder, owner });
+      if (!parentExist) {
+        return res.status(404).json({ message: 'Target folder not found' });
+      }
+    }
+
+    // Cycle check: check if targetFolder is a subfolder of any of the folderIds being moved
+    if (targetFolder && folderIds && folderIds.length > 0) {
+      const isSubfolder = async (childId, parentId) => {
+        if (!childId) return false;
+        const child = await Folder.findById(childId);
+        if (!child) return false;
+        if (child.parentFolder && child.parentFolder.toString() === parentId.toString()) {
+          return true;
+        }
+        return await isSubfolder(child.parentFolder, parentId);
+      };
+
+      for (const fId of folderIds) {
+        // Prevent moving a folder into itself
+        if (targetFolder.toString() === fId.toString()) {
+          return res.status(400).json({ message: 'Cannot move a folder into itself' });
+        }
+        // Prevent moving a folder into one of its subfolders
+        const invalidMove = await isSubfolder(targetFolder, fId);
+        if (invalidMove) {
+          return res.status(400).json({ message: 'Cannot move a folder into its own subfolder' });
+        }
+      }
+    }
+
+    // Move folders
+    if (folderIds && folderIds.length > 0) {
+      await Folder.updateMany(
+        { _id: { $in: folderIds }, owner },
+        { parentFolder: targetFolder }
+      );
+    }
+
+    // Move files
+    if (fileIds && fileIds.length > 0) {
+      await File.updateMany(
+        { _id: { $in: fileIds }, owner },
+        { folder: targetFolder }
+      );
+
+      // Sync Movie folder reference for moved files
+      const Movie = require('../models/Movie');
+      const movedFiles = await File.find({ _id: { $in: fileIds }, owner });
+      const movedFileKeys = movedFiles.map(f => f.key);
+      await Movie.updateMany(
+        { videoKey: { $in: movedFileKeys } },
+        { folder: targetFolder }
+      );
+    }
+
+    // Invalidate Cache for all user directories
+    await invalidateAllUserCache(owner);
+
+    return res.json({ success: true, message: 'Items moved successfully' });
+  } catch (error) {
+    console.error('Bulk move error:', error);
+    return res.status(500).json({ message: 'Server error moving items' });
   }
 };
 

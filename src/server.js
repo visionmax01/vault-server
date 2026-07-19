@@ -33,8 +33,14 @@ app.use(cors({
   credentials: true
 }));
 
-// Body parser
-app.use(express.json());
+// Body parser with raw body verifier for Stripe webhooks signature verification
+app.use(express.json({
+  verify: (req, res, buf) => {
+    if (req.originalUrl.startsWith('/api/payment/webhook')) {
+      req.rawBody = buf;
+    }
+  }
+}));
 app.use(express.urlencoded({ extended: true }));
 
 // Log requests
@@ -44,10 +50,12 @@ app.use((req, res, next) => {
 });
 
 // Setup api routes
+const paymentRoutes = require('./routes/payment');
 app.use('/api/auth', authRoutes);
 app.use('/api/vault', vaultRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/movies', movieRoutes);
+app.use('/api/payment', paymentRoutes);
 
 // Health check API
 app.get('/health', (req, res) => {
@@ -79,6 +87,25 @@ const startServer = async () => {
     });
     console.log('MongoDB database connected successfully.');
 
+    // Drop old unique indexes to prevent conflict with updated schemas
+    try {
+      const File = require('./models/File');
+      const Folder = require('./models/Folder');
+      await File.collection.dropIndex('name_1_folder_1_owner_1').catch(() => {});
+      await Folder.collection.dropIndex('name_1_parentFolder_1_owner_1').catch(() => {});
+      console.log('Successfully dropped old unique indexes (if any) to sync with soft-delete schema.');
+    } catch (indexErr) {
+      console.warn('Index drop warning (non-fatal):', indexErr.message);
+    }
+
+    // Initialize Redis client layer
+    try {
+      const { initRedis } = require('./utils/redisClient');
+      await initRedis();
+    } catch (redisErr) {
+      console.warn('Redis connection issue (gracefully skipped):', redisErr.message);
+    }
+
     // Initialize MinIO Bucket
     console.log('Initializing MinIO configuration...');
     await initMinio();
@@ -94,6 +121,10 @@ const startServer = async () => {
     // Initialize WebSockets
     const { initSockets } = require('./sockets');
     initSockets(serverInstance);
+
+    // Initialize Trash Auto-Delete Worker
+    const { initTrashWorker } = require('./utils/trashWorker');
+    initTrashWorker();
   } catch (error) {
     console.error('Fatal initialization error, server stopping:', error);
     process.exit(1);

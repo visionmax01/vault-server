@@ -33,13 +33,26 @@ const fileSchema = new mongoose.Schema({
     type: String,
     default: null,
   },
+  isDeleted: {
+    type: Boolean,
+    default: false,
+  },
+  deletedAt: {
+    type: Date,
+    default: null,
+  },
+  deletedParent: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Folder',
+    default: null,
+  },
   createdAt: {
     type: Date,
     default: Date.now,
   }
 });
 
-// Compound index to ensure uniqueness of file names within the same folder for a given user
-fileSchema.index({ name: 1, folder: 1, owner: 1 }, { unique: true });
+// Compound index to help search query performance
+fileSchema.index({ name: 1, folder: 1, owner: 1 });
 
 module.exports = mongoose.model('File', fileSchema);

@@ -17,6 +17,8 @@
     "mongoose": "^8.3.1",
     "multer": "^1.4.5-lts.1",
     "pdf-to-png-converter": "^4.1.0",
+    "redis": "^6.1.0",
+    "stripe": "^22.3.1",
     "ws": "^8.21.0"
   },
   "devDependencies": {

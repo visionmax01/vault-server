@@ -35,6 +35,14 @@ const userSchema = new mongoose.Schema({
     expiresAt: {
       type: Date,
       default: null,
+    },
+    stripeCustomerId: {
+      type: String,
+      default: null,
+    },
+    stripeSubscriptionId: {
+      type: String,
+      default: null,
     }
   },
   avatarKey: {

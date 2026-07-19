@@ -98,18 +98,13 @@ const deleteCache = async (key) => {
  * Invalidates cache for a specific folder content listing
  */
 const invalidateFolderCache = async (owner, folderId) => {
-  const key = `vault:content:${owner}:${folderId || 'root'}`;
-  await deleteCache(key);
-  console.log(`[Redis Cache Invalidate] Cleared key: ${key}`);
-};
-
-/**
- * Invalidates all cache entries for a user by scanning keys
- */
-const invalidateAllUserCache = async (owner) => {
   if (!isRedisConnected || !client) return false;
   try {
-    const pattern = `vault:content:${owner}:*`;
+    const targetFolder = folderId || 'root';
+    const directKey = `vault:content:${owner}:${owner}:${targetFolder}`;
+    await client.del(directKey);
+
+    const pattern = `vault:content:*:${targetFolder}`;
     let cursor = 0;
     do {
       const reply = await client.scan(cursor, {
@@ -120,9 +115,38 @@ const invalidateAllUserCache = async (owner) => {
       const keys = reply.keys;
       if (keys.length > 0) {
         await client.del(keys);
-        console.log(`[Redis Cache Invalidate] Cleared ${keys.length} keys for user ${owner}`);
+        console.log(`[Redis Cache Invalidate] Cleared ${keys.length} keys for folder: ${targetFolder}`);
       }
     } while (cursor !== 0);
+    return true;
+  } catch (error) {
+    console.warn('[Redis invalidateFolderCache error]:', error.message);
+    return false;
+  }
+};
+
+/**
+ * Invalidates all cache entries for a user by scanning keys
+ */
+const invalidateAllUserCache = async (owner) => {
+  if (!isRedisConnected || !client) return false;
+  try {
+    const patterns = [`vault:content:${owner}:*`, `vault:content:*:${owner}:*`];
+    for (const pattern of patterns) {
+      let cursor = 0;
+      do {
+        const reply = await client.scan(cursor, {
+          MATCH: pattern,
+          COUNT: 100
+        });
+        cursor = reply.cursor;
+        const keys = reply.keys;
+        if (keys.length > 0) {
+          await client.del(keys);
+          console.log(`[Redis Cache Invalidate] Cleared ${keys.length} keys matching pattern ${pattern}`);
+        }
+      } while (cursor !== 0);
+    }
     return true;
   } catch (error) {
     console.warn('[Redis invalidateAllUserCache error]:', error.message);

@@ -150,4 +150,12 @@ router.post('/avatar', upload.single('avatar'), vaultController.uploadAvatar);
 // @desc    Stream user profile avatar image
 router.get('/avatar/:userId', vaultController.streamAvatar);
 
+// @route   POST api/vault/share
+// @desc    Share a folder or file with a user by email
+router.post('/share', vaultController.shareItem);
+
+// @route   GET api/vault/shared
+// @desc    Get all files/folders shared with current user
+router.get('/shared', vaultController.getSharedContent);
+
 module.exports = router;

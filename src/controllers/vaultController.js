@@ -46,6 +46,29 @@ const getHlsSubKeys = (masterKey) => {
   });
 };
 
+// Helpers for sharing permissions checks
+const hasAccessToFolder = async (folderId, userId) => {
+  let currentFolder = await Folder.findById(folderId);
+  while (currentFolder) {
+    if (currentFolder.owner.toString() === userId.toString()) return true;
+    if (currentFolder.sharedWith && currentFolder.sharedWith.some(id => id.toString() === userId.toString())) {
+      return true;
+    }
+    if (!currentFolder.parentFolder) break;
+    currentFolder = await Folder.findById(currentFolder.parentFolder);
+  }
+  return false;
+};
+
+const hasAccessToFile = async (file, userId) => {
+  if (file.owner.toString() === userId.toString()) return true;
+  if (file.sharedWith && file.sharedWith.some(id => id.toString() === userId.toString())) return true;
+  if (file.folder) {
+    return await hasAccessToFolder(file.folder, userId);
+  }
+  return false;
+};
+
 // 1. Get folders and files in current folder
 exports.getContent = async (req, res) => {
   try {
@@ -57,7 +80,24 @@ exports.getContent = async (req, res) => {
       folderId = null;
     }
 
-    const cacheKey = `vault:content:${owner}:${folderId || 'root'}`;
+    let queryOwner = owner;
+    if (folderId) {
+      const folderDoc = await Folder.findById(folderId);
+      if (!folderDoc) {
+        return res.status(404).json({ message: 'Folder not found' });
+      }
+      
+      const isOwner = folderDoc.owner.toString() === owner;
+      if (!isOwner) {
+        const hasAccess = await hasAccessToFolder(folderId, owner);
+        if (!hasAccess) {
+          return res.status(403).json({ message: 'Access denied to this folder' });
+        }
+        queryOwner = folderDoc.owner.toString();
+      }
+    }
+
+    const cacheKey = `vault:content:${owner}:${queryOwner}:${folderId || 'root'}`;
 
     // Try reading from cache
     const cachedData = await getCache(cacheKey);
@@ -66,10 +106,10 @@ exports.getContent = async (req, res) => {
     }
 
     // Fetch folders (excluding deleted)
-    const folders = await Folder.find({ owner, parentFolder: folderId, isDeleted: { $ne: true } }).sort({ name: 1 });
+    const folders = await Folder.find({ owner: queryOwner, parentFolder: folderId, isDeleted: { $ne: true } }).sort({ name: 1 });
 
     // Fetch files (excluding deleted)
-    const files = await File.find({ owner, folder: folderId, isDeleted: { $ne: true } }).sort({ name: 1 });
+    const files = await File.find({ owner: queryOwner, folder: folderId, isDeleted: { $ne: true } }).sort({ name: 1 });
 
     const responseData = { folders, files };
 
@@ -883,9 +923,14 @@ exports.streamFile = async (req, res) => {
     const { fileId, filename } = req.params;
     const owner = req.user.id; // User id verified from JWT token (query or headers)
 
-    const file = await File.findOne({ _id: fileId, owner });
-    if (!file) {
-      return res.status(404).json({ message: 'File not found or unauthorized' });
+    const file = await File.findById(fileId);
+    if (!file || file.isDeleted) {
+      return res.status(404).json({ message: 'File not found' });
+    }
+
+    const hasAccess = await hasAccessToFile(file, owner);
+    if (!hasAccess) {
+      return res.status(403).json({ message: 'Unauthorized access to this file' });
     }
 
     if (file.mimeType === 'application/x-mpegURL' && filename) {
@@ -1297,9 +1342,14 @@ exports.streamThumbnail = async (req, res) => {
     const { fileId } = req.params;
     const owner = req.user.id;
 
-    const file = await File.findOne({ _id: fileId, owner });
-    if (!file || !file.thumbnailKey) {
-      return res.status(404).json({ message: 'Thumbnail not found or unauthorized' });
+    const file = await File.findById(fileId);
+    if (!file || !file.thumbnailKey || file.isDeleted) {
+      return res.status(404).json({ message: 'Thumbnail not found' });
+    }
+
+    const hasAccess = await hasAccessToFile(file, owner);
+    if (!hasAccess) {
+      return res.status(403).json({ message: 'Unauthorized access to this thumbnail' });
     }
 
     const dataStream = await minioClient.getObject(bucketName, file.thumbnailKey);
@@ -1567,6 +1617,82 @@ exports.bulkMove = async (req, res) => {
   } catch (error) {
     console.error('Bulk move error:', error);
     return res.status(500).json({ message: 'Server error moving items' });
+  }
+};
+
+exports.shareItem = async (req, res) => {
+  try {
+    const owner = req.user.id;
+    const { itemId, itemType, email } = req.body;
+
+    if (!itemId || !itemType || !email) {
+      return res.status(400).json({ message: 'itemId, itemType, and email are required' });
+    }
+
+    if (itemType !== 'file' && itemType !== 'folder') {
+      return res.status(400).json({ message: 'itemType must be file or folder' });
+    }
+
+    const targetEmail = email.trim().toLowerCase();
+    const targetUser = await User.findOne({ email: targetEmail });
+    if (!targetUser) {
+      return res.status(404).json({ message: `User with email "${email}" not found` });
+    }
+
+    if (targetUser._id.toString() === owner) {
+      return res.status(400).json({ message: 'You cannot share items with yourself' });
+    }
+
+    if (itemType === 'folder') {
+      const folder = await Folder.findOne({ _id: itemId, owner });
+      if (!folder) {
+        return res.status(404).json({ message: 'Folder not found or unauthorized' });
+      }
+
+      if (!folder.sharedWith.includes(targetUser._id)) {
+        folder.sharedWith.push(targetUser._id);
+        await folder.save();
+      }
+    } else {
+      const file = await File.findOne({ _id: itemId, owner });
+      if (!file) {
+        return res.status(404).json({ message: 'File not found or unauthorized' });
+      }
+
+      if (!file.sharedWith.includes(targetUser._id)) {
+        file.sharedWith.push(targetUser._id);
+        await file.save();
+      }
+    }
+
+    // Invalidate recipient's cache to show new item instantly
+    await invalidateAllUserCache(targetUser._id.toString());
+
+    return res.json({ success: true, message: `Item shared successfully with ${targetUser.name}` });
+  } catch (error) {
+    console.error('Share item error:', error);
+    return res.status(500).json({ message: 'Server error sharing item' });
+  }
+};
+
+exports.getSharedContent = async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Fetch folders shared with current user
+    const folders = await Folder.find({ sharedWith: userId, isDeleted: { $ne: true } })
+      .populate('owner', 'name email')
+      .sort({ name: 1 });
+
+    // Fetch files shared with current user
+    const files = await File.find({ sharedWith: userId, isDeleted: { $ne: true } })
+      .populate('owner', 'name email')
+      .sort({ name: 1 });
+
+    return res.json({ folders, files });
+  } catch (error) {
+    console.error('Get shared content error:', error);
+    return res.status(500).json({ message: 'Server error retrieving shared content' });
   }
 };
 

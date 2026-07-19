@@ -49,7 +49,11 @@ const fileSchema = new mongoose.Schema({
   createdAt: {
     type: Date,
     default: Date.now,
-  }
+  },
+  sharedWith: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  }]
 });
 
 // Compound index to help search query performance
